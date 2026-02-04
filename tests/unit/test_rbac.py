@@ -81,7 +81,7 @@ class TestAuthorizationService:
 
     def test_admin_can_access_all_tools(self):
         """Test that mcp-admin role can access all tools including execute_query."""
-        auth_service = AuthorizationService()
+        auth_service = AuthorizationService(admin_emails={"admin@example.com"})
 
         # Admin should be able to access everything
         all_tools = [
@@ -92,7 +92,8 @@ class TestAuthorizationService:
         ]
 
         for tool in all_tools:
-            assert auth_service.is_authorized(["mcp-admin"], tool) is True
+            # Use email-based admin assignment
+            assert auth_service.is_authorized([], tool, user_email="admin@example.com") is True
 
     def test_user_with_no_groups_denied_strict(self):
         """Test that users without groups are denied access in strict mode."""
@@ -138,15 +139,18 @@ class TestAuthorizationService:
         # But not admin access
         assert auth_service.is_authorized(groups, "execute_query") is False
 
-    def test_admin_overrides_viewer(self):
-        """Test that admin role grants full access even with viewer role."""
-        auth_service = AuthorizationService()
+    def test_admin_email_grants_full_access(self):
+        """Test that admin email grants full access including execute_query."""
+        auth_service = AuthorizationService(admin_emails={"admin@example.com"})
 
-        # User has both viewer and admin
-        groups = ["mcp-viewer", "mcp-admin"]
-
-        # Should have admin (full) access
-        assert auth_service.is_authorized(groups, "execute_query") is True
+        # Admin email should grant full access
+        assert (
+            auth_service.is_authorized([], "execute_query", user_email="admin@example.com") is True
+        )
+        # Non-admin email should not have execute_query
+        assert (
+            auth_service.is_authorized([], "execute_query", user_email="user@example.com") is False
+        )
 
     def test_get_allowed_tools_for_viewer(self):
         """Test getting allowed tools for viewer role."""
@@ -161,9 +165,10 @@ class TestAuthorizationService:
 
     def test_get_allowed_tools_for_admin(self):
         """Test getting allowed tools for admin role returns wildcard."""
-        auth_service = AuthorizationService()
+        auth_service = AuthorizationService(admin_emails={"admin@example.com"})
 
-        allowed = auth_service.get_allowed_tools(["mcp-admin"])
+        # Use email-based admin assignment
+        allowed = auth_service.get_allowed_tools([], user_email="admin@example.com")
 
         assert allowed == {"*"}
 
@@ -445,19 +450,22 @@ class TestToolHandlerRBAC:
 
     @pytest.mark.asyncio
     async def test_admin_can_call_any_tool(self):
-        """Test that admin can call any tool."""
-        handler = ToolHandler(
-            self.mock_tools_manager,
-            self.mock_security_manager,
-            rbac_enabled=True,
-        )
+        """Test that admin (via email whitelist) can call any tool."""
+        # Create handler with admin emails configured
+        with patch.dict(os.environ, {"RBAC_ADMIN_EMAILS": "admin@example.com"}):
+            handler = ToolHandler(
+                self.mock_tools_manager,
+                self.mock_security_manager,
+                rbac_enabled=True,
+            )
 
-        # Set user context with admin role
+        # Set user context with admin email
         set_user_context(
             {
                 "id": "admin-123",
                 "username": "admin-user",
-                "groups": ["mcp-admin"],
+                "email": "admin@example.com",
+                "groups": [],
             }
         )
 

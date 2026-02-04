@@ -2,17 +2,16 @@
 """
 Role-Based Access Control (RBAC) for Konflux DevLake MCP Server
 
-This module provides authorization based on user roles/groups from OIDC tokens.
+This module provides email-based authorization for MCP tools.
 Roles are mapped to allowed tools, enforcing the principle of least privilege.
 
-Role Assignment Methods:
-1. Group-based: User's OIDC groups (realm_access.roles) are matched to role names
-2. Email-based: User's email is checked against admin email whitelist
+Role Assignment (email-based):
+- If user's email is in RBAC_ADMIN_EMAILS -> mcp-admin (full access incl. execute_query)
+- Otherwise -> mcp-viewer (all tools EXCEPT execute_query)
 
-The email-based method is useful when you can't control Keycloak group assignments.
-Configure via environment variables:
+Configure via environment variables (set in OCP ConfigMap):
   - RBAC_ADMIN_EMAILS: Comma-separated list of admin email addresses
-  - RBAC_DEFAULT_ROLE: Role for authenticated users not in admin list (default: mcp-viewer)
+  - RBAC_DEFAULT_ROLE: Role for users not in admin list (default: mcp-viewer)
 """
 
 import os
@@ -96,13 +95,12 @@ class AuthorizationService:
     """
     Authorization service for enforcing role-based access control.
 
-    This service checks if a user (based on their OIDC groups or email) is authorized
-    to call specific MCP tools.
+    This service checks if a user is authorized to call specific MCP tools
+    based on their email address.
 
-    Role Resolution Order:
-    1. If user has OIDC groups matching defined roles, use those
-    2. If user's email is in admin whitelist, assign mcp-admin role
-    3. Otherwise, use default role (mcp-viewer by default)
+    Role Resolution (email-based only):
+    - If user's email is in RBAC_ADMIN_EMAILS (ConfigMap) -> mcp-admin (full access)
+    - Otherwise -> mcp-viewer (no execute_query)
     """
 
     def __init__(
@@ -150,45 +148,32 @@ class AuthorizationService:
         self, user_groups: List[str], user_email: Optional[str] = None
     ) -> List[str]:
         """
-        Resolve the effective roles for a user.
+        Resolve the effective roles for a user based on email.
 
-        This method determines which roles apply to the user based on:
-        1. OIDC groups that match defined role names
-        2. Email-based assignment (if enabled and email provided)
-        3. Default role (if no other roles match)
+        Role assignment is purely email-based:
+        - Email in admin list (RBAC_ADMIN_EMAILS) -> mcp-admin
+        - Otherwise -> mcp-viewer (default)
 
         Args:
-            user_groups: Groups from the user's OIDC token
+            user_groups: Groups from the user's OIDC token (not used, kept for interface)
             user_email: User's email address from OIDC token
 
         Returns:
             List of resolved role names
         """
-        resolved_roles = []
-
-        # Check OIDC groups against defined roles
-        for group in user_groups:
-            if group in self.role_permissions:
-                resolved_roles.append(group)
-                self.logger.debug(f"Role '{group}' matched from OIDC groups")
-
-        # Email-based role assignment
-        if self.use_email_roles and user_email:
+        # Email-based role assignment only
+        if user_email:
             email_lower = user_email.lower()
             if email_lower in self.admin_emails:
-                if "mcp-admin" not in resolved_roles:
-                    resolved_roles.append("mcp-admin")
-                    self.logger.info(f"Admin role assigned via email whitelist: {user_email}")
-            elif not resolved_roles and self.default_role:
-                # No group-based roles found, assign default
-                resolved_roles.append(self.default_role)
-                self.logger.debug(f"Default role '{self.default_role}' assigned to {user_email}")
+                self.logger.info(f"Admin role assigned via email whitelist: {user_email}")
+                return ["mcp-admin"]
 
-        # If still no roles and default is set, use it
-        if not resolved_roles and self.default_role:
-            resolved_roles.append(self.default_role)
+        # Default role for everyone else
+        if self.default_role:
+            self.logger.debug(f"Default role '{self.default_role}' assigned to {user_email}")
+            return [self.default_role]
 
-        return resolved_roles
+        return []
 
     def is_authorized(
         self,
