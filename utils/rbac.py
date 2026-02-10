@@ -63,22 +63,31 @@ DEFAULT_ROLE: Optional[str] = None  # None means no access without explicit role
 _NOT_SET = object()
 
 
-def get_admin_emails_from_env() -> Set[str]:
+def get_admin_usernames_from_env() -> Set[str]:
     """
-    Get admin email addresses from environment variable.
+    Get admin usernames from environment variable.
 
-    The RBAC_ADMIN_EMAILS environment variable should contain a comma-separated
-    list of email addresses that should have admin access.
+    The RBAC_ADMIN_USERNAMES environment variable should contain a comma-separated
+    list of usernames (without @domain) that should have admin access.
+
+    Example: "daturece,teammate1,teammate2"
 
     Returns:
-        Set of admin email addresses (lowercase for case-insensitive matching)
+        Set of admin usernames (lowercase for case-insensitive matching)
     """
-    env_value = os.environ.get("RBAC_ADMIN_EMAILS", "")
+    env_value = os.environ.get("RBAC_ADMIN_USERNAMES", "")
     if not env_value:
         return set()
 
-    emails = {email.strip().lower() for email in env_value.split(",") if email.strip()}
-    return emails
+    usernames = {name.strip().lower() for name in env_value.split(",") if name.strip()}
+    return usernames
+
+
+def extract_username_from_email(email: str) -> str:
+    """Extract the username part from an email address."""
+    if "@" in email:
+        return email.split("@")[0].lower()
+    return email.lower()
 
 
 def get_default_role_from_env() -> Optional[str]:
@@ -96,18 +105,23 @@ class AuthorizationService:
     Authorization service for enforcing role-based access control.
 
     This service checks if a user is authorized to call specific MCP tools
-    based on their email address.
+    based on their email username.
 
-    Role Resolution (email-based only):
-    - If user's email is in RBAC_ADMIN_EMAILS (ConfigMap) -> mcp-admin (full access)
+    Role Resolution (username-based):
+    - If user's email username is in RBAC_ADMIN_USERNAMES (ConfigMap) -> mcp-admin (full access)
     - Otherwise -> mcp-viewer (no execute_query)
+
+    Example:
+        RBAC_ADMIN_USERNAMES: "daturece,teammate1"
+        Token email: "daturece@redhat.com"
+        -> Username "daturece" matches -> mcp-admin role
     """
 
     def __init__(
         self,
         role_permissions: Optional[Dict[str, Set[str]]] = None,
         default_role: Any = _NOT_SET,
-        admin_emails: Optional[Set[str]] = None,
+        admin_usernames: Optional[Set[str]] = None,
         use_email_roles: bool = True,
     ):
         """
@@ -117,7 +131,7 @@ class AuthorizationService:
             role_permissions: Custom role-to-permissions mapping (uses default if None)
             default_role: Default role for users without explicit group assignment.
                           Pass None to disable default roles, or omit to use env var.
-            admin_emails: Set of email addresses that should have admin access
+            admin_usernames: Set of usernames (without @domain) that should have admin access
             use_email_roles: Whether to use email-based role assignment (default: True)
         """
         self.logger = get_logger(f"{__name__}.AuthorizationService")
@@ -131,28 +145,33 @@ class AuthorizationService:
 
         self.use_email_roles = use_email_roles
 
-        # Get admin emails from parameter or environment
-        if admin_emails is not None:
-            self.admin_emails = {e.lower() for e in admin_emails}
+        # Get admin usernames from parameter or environment
+        if admin_usernames is not None:
+            self.admin_usernames = {u.lower() for u in admin_usernames}
         else:
-            self.admin_emails = get_admin_emails_from_env()
+            self.admin_usernames = get_admin_usernames_from_env()
 
         self.logger.info(
             f"Authorization service initialized with {len(self.role_permissions)} roles, "
-            f"{len(self.admin_emails)} admin emails, default_role={self.default_role}"
+            f"{len(self.admin_usernames)} admin usernames, default_role={self.default_role}"
         )
-        if self.admin_emails:
-            self.logger.info(f"Admin emails configured: {len(self.admin_emails)} addresses")
+        if self.admin_usernames:
+            self.logger.info(f"Admin usernames configured: {len(self.admin_usernames)} users")
 
     def resolve_user_roles(
         self, user_groups: List[str], user_email: Optional[str] = None
     ) -> List[str]:
         """
-        Resolve the effective roles for a user based on email.
+        Resolve the effective roles for a user based on email username.
 
-        Role assignment is purely email-based:
-        - Email in admin list (RBAC_ADMIN_EMAILS) -> mcp-admin
+        Role assignment is username-based:
+        - Username (before @) in RBAC_ADMIN_USERNAMES -> mcp-admin
         - Otherwise -> mcp-viewer (default)
+
+        Example:
+            RBAC_ADMIN_USERNAMES: "daturece"
+            Token email: "daturece@redhat.com"
+            -> Username "daturece" matches -> mcp-admin role
 
         Args:
             user_groups: Groups from the user's OIDC token (not used, kept for interface)
@@ -161,11 +180,11 @@ class AuthorizationService:
         Returns:
             List of resolved role names
         """
-        # Email-based role assignment only
+        # Username-based role assignment
         if user_email:
-            email_lower = user_email.lower()
-            if email_lower in self.admin_emails:
-                self.logger.info(f"Admin role assigned via email whitelist: {user_email}")
+            username = extract_username_from_email(user_email)
+            if username in self.admin_usernames:
+                self.logger.info(f"Admin role assigned via username whitelist: {username}")
                 return ["mcp-admin"]
 
         # Default role for everyone else
@@ -313,5 +332,5 @@ class AuthorizationService:
             "default_role": self.default_role,
             "total_roles": len(self.role_permissions),
             "email_based_roles": self.use_email_roles,
-            "admin_emails_configured": len(self.admin_emails),
+            "admin_usernames_configured": len(self.admin_usernames),
         }

@@ -144,6 +144,19 @@ spec:
                   name: konflux-mcp-config
                   key: OIDC_ACCESS_TOKEN_CACHE_BUFFER
                   optional: true
+            # RBAC Configuration (from separate ConfigMap to keep user info out of git)
+            - name: RBAC_ADMIN_USERNAMES
+              valueFrom:
+                configMapKeyRef:
+                  name: konflux-mcp-rbac
+                  key: RBAC_ADMIN_USERNAMES
+                  optional: true
+            - name: RBAC_DEFAULT_ROLE
+              valueFrom:
+                configMapKeyRef:
+                  name: konflux-mcp-config
+                  key: RBAC_DEFAULT_ROLE
+                  optional: true
             # SSE/Long-lived connection timeouts (1 hour)
             - name: SERVER_TIMEOUT_KEEP_ALIVE
               value: "3600"

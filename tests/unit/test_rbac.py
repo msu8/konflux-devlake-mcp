@@ -12,8 +12,9 @@ from unittest.mock import MagicMock, patch
 from utils.rbac import (
     AuthorizationService,
     ROLE_PERMISSIONS,
-    get_admin_emails_from_env,
+    get_admin_usernames_from_env,
     get_default_role_from_env,
+    extract_username_from_email,
 )
 from server.handlers.tool_handler import (
     ToolHandler,
@@ -81,7 +82,7 @@ class TestAuthorizationService:
 
     def test_admin_can_access_all_tools(self):
         """Test that mcp-admin role can access all tools including execute_query."""
-        auth_service = AuthorizationService(admin_emails={"admin@example.com"})
+        auth_service = AuthorizationService(admin_usernames={"admin"})
 
         # Admin should be able to access everything
         all_tools = [
@@ -141,7 +142,7 @@ class TestAuthorizationService:
 
     def test_admin_email_grants_full_access(self):
         """Test that admin email grants full access including execute_query."""
-        auth_service = AuthorizationService(admin_emails={"admin@example.com"})
+        auth_service = AuthorizationService(admin_usernames={"admin"})
 
         # Admin email should grant full access
         assert (
@@ -165,7 +166,7 @@ class TestAuthorizationService:
 
     def test_get_allowed_tools_for_admin(self):
         """Test getting allowed tools for admin role returns wildcard."""
-        auth_service = AuthorizationService(admin_emails={"admin@example.com"})
+        auth_service = AuthorizationService(admin_usernames={"admin"})
 
         # Use email-based admin assignment
         allowed = auth_service.get_allowed_tools([], user_email="admin@example.com")
@@ -223,15 +224,15 @@ class TestAuthorizationService:
         assert auth_service.is_authorized([], "execute_query") is False
 
 
-class TestEmailBasedRoles:
-    """Tests for email-based role assignment."""
+class TestUsernameBasedRoles:
+    """Tests for username-based role assignment."""
 
-    def test_admin_email_gets_admin_role(self):
-        """Test that admin email whitelist grants admin access."""
-        admin_emails = {"admin@redhat.com", "team-lead@redhat.com"}
-        auth_service = AuthorizationService(admin_emails=admin_emails)
+    def test_admin_username_gets_admin_role(self):
+        """Test that admin username whitelist grants admin access."""
+        admin_usernames = {"admin", "team-lead"}
+        auth_service = AuthorizationService(admin_usernames=admin_usernames)
 
-        # Admin email should get full access
+        # Admin username should get full access
         assert (
             auth_service.is_authorized([], "execute_query", user_email="admin@redhat.com") is True
         )
@@ -239,12 +240,12 @@ class TestEmailBasedRoles:
             auth_service.is_authorized([], "list_databases", user_email="admin@redhat.com") is True
         )
 
-    def test_non_admin_email_gets_viewer_role(self):
-        """Test that non-admin email gets viewer role."""
-        admin_emails = {"admin@redhat.com"}
-        auth_service = AuthorizationService(admin_emails=admin_emails)
+    def test_non_admin_username_gets_viewer_role(self):
+        """Test that non-admin username gets viewer role."""
+        admin_usernames = {"admin"}
+        auth_service = AuthorizationService(admin_usernames=admin_usernames)
 
-        # Non-admin email should get viewer access only
+        # Non-admin username should get viewer access only
         assert (
             auth_service.is_authorized([], "list_databases", user_email="user@redhat.com") is True
         )
@@ -252,10 +253,10 @@ class TestEmailBasedRoles:
             auth_service.is_authorized([], "execute_query", user_email="user@redhat.com") is False
         )
 
-    def test_email_matching_case_insensitive(self):
-        """Test that email matching is case-insensitive."""
-        admin_emails = {"admin@redhat.com"}
-        auth_service = AuthorizationService(admin_emails=admin_emails)
+    def test_username_matching_case_insensitive(self):
+        """Test that username matching is case-insensitive."""
+        admin_usernames = {"admin"}
+        auth_service = AuthorizationService(admin_usernames=admin_usernames)
 
         # Should match regardless of case
         assert (
@@ -265,55 +266,61 @@ class TestEmailBasedRoles:
             auth_service.is_authorized([], "execute_query", user_email="Admin@Redhat.Com") is True
         )
 
-    def test_group_based_takes_precedence(self):
-        """Test that explicit group membership takes precedence over email."""
-        admin_emails = {"user@redhat.com"}  # Email would grant admin
-        auth_service = AuthorizationService(admin_emails=admin_emails)
+    def test_username_extracted_correctly(self):
+        """Test that username is extracted from email correctly."""
+        admin_usernames = {"daturece"}
+        auth_service = AuthorizationService(admin_usernames=admin_usernames)
 
-        # User has viewer group - should get admin because of email whitelist
+        # Username should be extracted from various email formats
         assert (
-            auth_service.is_authorized(
-                ["mcp-viewer"], "execute_query", user_email="user@redhat.com"
-            )
+            auth_service.is_authorized([], "execute_query", user_email="daturece@redhat.com")
+            is True
+        )
+        assert (
+            auth_service.is_authorized([], "execute_query", user_email="daturece@example.org")
             is True
         )
 
-    def test_resolve_user_roles_with_email(self):
-        """Test resolving roles when email matches admin list."""
-        admin_emails = {"admin@redhat.com"}
-        auth_service = AuthorizationService(admin_emails=admin_emails)
+    def test_resolve_user_roles_with_username(self):
+        """Test resolving roles when username matches admin list."""
+        admin_usernames = {"admin"}
+        auth_service = AuthorizationService(admin_usernames=admin_usernames)
 
         roles = auth_service.resolve_user_roles([], "admin@redhat.com")
         assert "mcp-admin" in roles
 
     def test_resolve_user_roles_without_match(self):
-        """Test resolving roles when email doesn't match admin list."""
-        admin_emails = {"admin@redhat.com"}
-        auth_service = AuthorizationService(admin_emails=admin_emails)
+        """Test resolving roles when username doesn't match admin list."""
+        admin_usernames = {"admin"}
+        auth_service = AuthorizationService(admin_usernames=admin_usernames)
 
         roles = auth_service.resolve_user_roles([], "user@redhat.com")
         assert "mcp-viewer" in roles
         assert "mcp-admin" not in roles
 
-    def test_get_admin_emails_from_env(self):
-        """Test reading admin emails from environment variable."""
-        with patch.dict(
-            os.environ, {"RBAC_ADMIN_EMAILS": "admin1@test.com, admin2@test.com, Admin3@Test.com"}
-        ):
-            emails = get_admin_emails_from_env()
+    def test_get_admin_usernames_from_env(self):
+        """Test reading admin usernames from environment variable."""
+        with patch.dict(os.environ, {"RBAC_ADMIN_USERNAMES": "admin1, admin2, Admin3"}):
+            usernames = get_admin_usernames_from_env()
 
-            assert "admin1@test.com" in emails
-            assert "admin2@test.com" in emails
-            assert "admin3@test.com" in emails  # Should be lowercased
+            assert "admin1" in usernames
+            assert "admin2" in usernames
+            assert "admin3" in usernames  # Should be lowercased
 
-    def test_get_admin_emails_empty_env(self):
-        """Test reading admin emails when env var is not set."""
+    def test_get_admin_usernames_empty_env(self):
+        """Test reading admin usernames when env var is not set."""
         with patch.dict(os.environ, {}, clear=True):
             # Remove the env var if it exists
-            os.environ.pop("RBAC_ADMIN_EMAILS", None)
-            emails = get_admin_emails_from_env()
+            os.environ.pop("RBAC_ADMIN_USERNAMES", None)
+            usernames = get_admin_usernames_from_env()
 
-            assert emails == set()
+            assert usernames == set()
+
+    def test_extract_username_from_email(self):
+        """Test extracting username from email address."""
+        assert extract_username_from_email("daturece@redhat.com") == "daturece"
+        assert extract_username_from_email("ADMIN@EXAMPLE.COM") == "admin"
+        assert extract_username_from_email("user") == "user"
 
     def test_get_default_role_from_env(self):
         """Test reading default role from environment."""
@@ -450,9 +457,9 @@ class TestToolHandlerRBAC:
 
     @pytest.mark.asyncio
     async def test_admin_can_call_any_tool(self):
-        """Test that admin (via email whitelist) can call any tool."""
-        # Create handler with admin emails configured
-        with patch.dict(os.environ, {"RBAC_ADMIN_EMAILS": "admin@example.com"}):
+        """Test that admin (via username whitelist) can call any tool."""
+        # Create handler with admin usernames configured
+        with patch.dict(os.environ, {"RBAC_ADMIN_USERNAMES": "admin"}):
             handler = ToolHandler(
                 self.mock_tools_manager,
                 self.mock_security_manager,
