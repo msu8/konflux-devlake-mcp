@@ -2,22 +2,24 @@
 """
 Role-Based Access Control (RBAC) for Konflux DevLake MCP Server
 
-This module provides email-based authorization for MCP tools.
+This module provides LDAP/Rover group-based authorization for MCP tools.
 Roles are mapped to allowed tools, enforcing the principle of least privilege.
 
-Role Assignment (email-based):
-- If user's email is in RBAC_ADMIN_EMAILS -> mcp-admin (full access incl. execute_query)
+Role Assignment:
+- LDAP lookup - if user is in Rover group "devlakemcpadmin" -> mcp-admin
 - Otherwise -> mcp-viewer (all tools EXCEPT execute_query)
 
 Configure via environment variables (set in OCP ConfigMap):
-  - RBAC_ADMIN_EMAILS: Comma-separated list of admin email addresses
-  - RBAC_DEFAULT_ROLE: Role for users not in admin list (default: mcp-viewer)
+  - LDAP_ENABLED: Enable LDAP lookups (default: true if ldap3 available)
+  - LDAP_ADMIN_GROUP: Rover group name for admin access (default: devlakemcpadmin)
+  - RBAC_DEFAULT_ROLE: Role for non-admin users (default: mcp-viewer)
 """
 
 import os
 from typing import Any, Dict, List, Optional, Set
 
 from utils.logger import get_logger
+from utils.ldap_service import LDAPService
 
 # Role definitions mapping Keycloak groups to allowed tools
 # These group names should match what's configured in Red Hat SSO / Keycloak
@@ -63,26 +65,6 @@ DEFAULT_ROLE: Optional[str] = None  # None means no access without explicit role
 _NOT_SET = object()
 
 
-def get_admin_usernames_from_env() -> Set[str]:
-    """
-    Get admin usernames from environment variable.
-
-    The RBAC_ADMIN_USERNAMES environment variable should contain a comma-separated
-    list of usernames (without @domain) that should have admin access.
-
-    Example: "daturece,teammate1,teammate2"
-
-    Returns:
-        Set of admin usernames (lowercase for case-insensitive matching)
-    """
-    env_value = os.environ.get("RBAC_ADMIN_USERNAMES", "")
-    if not env_value:
-        return set()
-
-    usernames = {name.strip().lower() for name in env_value.split(",") if name.strip()}
-    return usernames
-
-
 def extract_username_from_email(email: str) -> str:
     """Extract the username part from an email address."""
     if "@" in email:
@@ -105,24 +87,24 @@ class AuthorizationService:
     Authorization service for enforcing role-based access control.
 
     This service checks if a user is authorized to call specific MCP tools
-    based on their email username.
+    based on LDAP Rover group membership.
 
-    Role Resolution (username-based):
-    - If user's email username is in RBAC_ADMIN_USERNAMES (ConfigMap) -> mcp-admin (full access)
+    Role Resolution:
+    - LDAP lookup - if user is in Rover group "devlakemcpadmin" -> mcp-admin
     - Otherwise -> mcp-viewer (no execute_query)
 
     Example:
-        RBAC_ADMIN_USERNAMES: "daturece,teammate1"
-        Token email: "daturece@redhat.com"
-        -> Username "daturece" matches -> mcp-admin role
+        User: "daturece@redhat.com"
+        LDAP check: is daturece in cn=devlakemcpadmin?
+        -> Yes -> mcp-admin
+        -> No -> mcp-viewer
     """
 
     def __init__(
         self,
         role_permissions: Optional[Dict[str, Set[str]]] = None,
         default_role: Any = _NOT_SET,
-        admin_usernames: Optional[Set[str]] = None,
-        use_email_roles: bool = True,
+        ldap_service: Optional[LDAPService] = None,
     ):
         """
         Initialize the authorization service.
@@ -131,8 +113,7 @@ class AuthorizationService:
             role_permissions: Custom role-to-permissions mapping (uses default if None)
             default_role: Default role for users without explicit group assignment.
                           Pass None to disable default roles, or omit to use env var.
-            admin_usernames: Set of usernames (without @domain) that should have admin access
-            use_email_roles: Whether to use email-based role assignment (default: True)
+            ldap_service: Optional LDAPService instance for Rover group lookups
         """
         self.logger = get_logger(f"{__name__}.AuthorizationService")
         self.role_permissions = role_permissions or ROLE_PERMISSIONS
@@ -143,49 +124,57 @@ class AuthorizationService:
         else:
             self.default_role = default_role
 
-        self.use_email_roles = use_email_roles
-
-        # Get admin usernames from parameter or environment
-        if admin_usernames is not None:
-            self.admin_usernames = {u.lower() for u in admin_usernames}
-        else:
-            self.admin_usernames = get_admin_usernames_from_env()
+        # Initialize LDAP service for Rover group lookups
+        self.ldap_service = ldap_service or LDAPService()
 
         self.logger.info(
             f"Authorization service initialized with {len(self.role_permissions)} roles, "
-            f"{len(self.admin_usernames)} admin usernames, default_role={self.default_role}"
+            f"LDAP enabled={self.ldap_service.enabled}, "
+            f"default_role={self.default_role}"
         )
-        if self.admin_usernames:
-            self.logger.info(f"Admin usernames configured: {len(self.admin_usernames)} users")
 
     def resolve_user_roles(
-        self, user_groups: List[str], user_email: Optional[str] = None
+        self,
+        user_groups: List[str],
+        user_email: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> List[str]:
         """
-        Resolve the effective roles for a user based on email username.
+        Resolve the effective roles for a user based on LDAP Rover groups.
 
-        Role assignment is username-based:
-        - Username (before @) in RBAC_ADMIN_USERNAMES -> mcp-admin
+        Role assignment:
+        - LDAP lookup - if user is in Rover group "devlakemcpadmin" -> mcp-admin
         - Otherwise -> mcp-viewer (default)
 
         Example:
-            RBAC_ADMIN_USERNAMES: "daturece"
-            Token email: "daturece@redhat.com"
-            -> Username "daturece" matches -> mcp-admin role
+            Username: "daturece"
+            LDAP check: is daturece in cn=devlakemcpadmin?
+            -> Yes -> mcp-admin
+            -> No -> mcp-viewer
 
         Args:
             user_groups: Groups from the user's OIDC token (not used, kept for interface)
-            user_email: User's email address from OIDC token
+            user_email: User's email address (fallback if username not provided)
+            username: User's username from OIDC token (preferred)
 
         Returns:
             List of resolved role names
         """
-        # Username-based role assignment
-        if user_email:
+        # Prefer username from token, fallback to extracting from email
+        if not username and user_email:
             username = extract_username_from_email(user_email)
-            if username in self.admin_usernames:
-                self.logger.info(f"Admin role assigned via username whitelist: {username}")
-                return ["mcp-admin"]
+
+        # Check LDAP Rover group membership
+        if username and self.ldap_service.enabled:
+            try:
+                if self.ldap_service.is_admin(username):
+                    self.logger.info(
+                        f"Admin role assigned via LDAP Rover group "
+                        f"'{self.ldap_service.admin_group}': {username}"
+                    )
+                    return ["mcp-admin"]
+            except Exception as e:
+                self.logger.warning(f"LDAP lookup failed for '{username}': {e}")
 
         # Default role for everyone else
         if self.default_role:
@@ -199,6 +188,7 @@ class AuthorizationService:
         user_groups: List[str],
         tool_name: str,
         user_email: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> bool:
         """
         Check if a user is authorized to call a specific tool.
@@ -206,13 +196,14 @@ class AuthorizationService:
         Args:
             user_groups: List of groups/roles from the user's OIDC token
             tool_name: Name of the tool being called
-            user_email: Optional email for email-based role resolution
+            user_email: Optional email (fallback if username not provided)
+            username: Optional username from OIDC token (preferred)
 
         Returns:
             True if the user is authorized, False otherwise
         """
-        # Resolve effective roles (considering groups, email, and defaults)
-        effective_roles = self.resolve_user_roles(user_groups, user_email)
+        # Resolve effective roles (considering LDAP groups)
+        effective_roles = self.resolve_user_roles(user_groups, user_email, username)
 
         if not effective_roles:
             self.logger.warning(f"Access denied: no roles resolved for tool '{tool_name}'")
@@ -249,20 +240,24 @@ class AuthorizationService:
         return tool_name in allowed_tools
 
     def get_allowed_tools(
-        self, user_groups: List[str], user_email: Optional[str] = None
+        self,
+        user_groups: List[str],
+        user_email: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> Set[str]:
         """
         Get all tools a user is allowed to call based on their roles.
 
         Args:
             user_groups: List of groups/roles from the user's OIDC token
-            user_email: Optional email for email-based role resolution
+            user_email: Optional email (fallback if username not provided)
+            username: Optional username from OIDC token (preferred)
 
         Returns:
             Set of allowed tool names (or {"*"} for full access)
         """
         # Resolve effective roles
-        effective_roles = self.resolve_user_roles(user_groups, user_email)
+        effective_roles = self.resolve_user_roles(user_groups, user_email, username)
 
         allowed = set()
 
@@ -276,7 +271,11 @@ class AuthorizationService:
         return allowed
 
     def get_denied_reason(
-        self, user_groups: List[str], tool_name: str, user_email: Optional[str] = None
+        self,
+        user_groups: List[str],
+        tool_name: str,
+        user_email: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> str:
         """
         Get a human-readable reason why access was denied.
@@ -284,13 +283,14 @@ class AuthorizationService:
         Args:
             user_groups: User's groups
             tool_name: Tool that was denied
-            user_email: User's email (for more informative message)
+            user_email: User's email (fallback if username not provided)
+            username: User's username from OIDC token (preferred)
 
         Returns:
             Explanation string for the denial
         """
         # Resolve effective roles to show what they actually have
-        effective_roles = self.resolve_user_roles(user_groups, user_email)
+        effective_roles = self.resolve_user_roles(user_groups, user_email, username)
 
         if not effective_roles:
             return (
@@ -331,6 +331,5 @@ class AuthorizationService:
             "roles": role_info,
             "default_role": self.default_role,
             "total_roles": len(self.role_permissions),
-            "email_based_roles": self.use_email_roles,
-            "admin_usernames_configured": len(self.admin_usernames),
+            "ldap": self.ldap_service.get_cache_stats() if self.ldap_service else None,
         }

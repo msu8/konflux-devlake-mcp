@@ -144,19 +144,17 @@ spec:
                   name: konflux-mcp-config
                   key: OIDC_ACCESS_TOKEN_CACHE_BUFFER
                   optional: true
-            # RBAC Configuration (from separate ConfigMap to keep user info out of git)
-            - name: RBAC_ADMIN_USERNAMES
-              valueFrom:
-                configMapKeyRef:
-                  name: konflux-mcp-rbac
-                  key: RBAC_ADMIN_USERNAMES
-                  optional: true
+            # RBAC Configuration (LDAP-based Rover group lookup)
+            - name: LDAP_ENABLED
+              value: "true"
+            - name: LDAP_SERVER
+              value: "ldaps://ldap.corp.redhat.com"
+            - name: LDAP_ADMIN_GROUP
+              value: "devlakemcpadmin"
+            - name: LDAP_CACHE_TTL
+              value: "300"
             - name: RBAC_DEFAULT_ROLE
-              valueFrom:
-                configMapKeyRef:
-                  name: konflux-mcp-config
-                  key: RBAC_DEFAULT_ROLE
-                  optional: true
+              value: "mcp-viewer"
             # SSE/Long-lived connection timeouts (1 hour)
             - name: SERVER_TIMEOUT_KEEP_ALIVE
               value: "3600"

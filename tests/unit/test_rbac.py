@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 from utils.rbac import (
     AuthorizationService,
     ROLE_PERMISSIONS,
-    get_admin_usernames_from_env,
     get_default_role_from_env,
     extract_username_from_email,
 )
@@ -23,24 +22,53 @@ from server.handlers.tool_handler import (
 )
 
 
+class MockLDAPService:
+    """Mock LDAP service for testing."""
+
+    def __init__(self, admin_users=None, enabled=True):
+        self.admin_users = admin_users or set()
+        self._enabled = enabled
+        self.admin_group = "devlakemcpadmin"
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    def is_admin(self, username):
+        return username.lower() in self.admin_users
+
+    def get_user_groups(self, username):
+        if username.lower() in self.admin_users:
+            return {self.admin_group}
+        return set()
+
+    def get_cache_stats(self):
+        return {
+            "enabled": self._enabled,
+            "server": "mock",
+            "admin_group": self.admin_group,
+            "cache_size": 0,
+            "cache_ttl": 300,
+        }
+
+
 class TestAuthorizationService:
     """Tests for AuthorizationService class."""
 
     def test_initialization_with_defaults(self):
         """Test authorization service initializes with default roles and viewer as default."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         assert auth_service.role_permissions == ROLE_PERMISSIONS
-        # Default role is mcp-viewer (from get_default_role_from_env)
         assert auth_service.default_role == "mcp-viewer"
-        assert auth_service.use_email_roles is True
 
     def test_initialization_with_strict_mode(self):
         """Test authorization service with strict mode (no default role)."""
-        auth_service = AuthorizationService(default_role=None, use_email_roles=False)
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(default_role=None, ldap_service=mock_ldap)
 
         assert auth_service.default_role is None
-        assert auth_service.use_email_roles is False
 
     def test_initialization_with_custom_roles(self):
         """Test authorization service with custom role definitions."""
@@ -48,16 +76,18 @@ class TestAuthorizationService:
             "custom-viewer": {"list_databases"},
             "custom-admin": {"*"},
         }
+        mock_ldap = MockLDAPService(enabled=False)
 
         auth_service = AuthorizationService(
-            role_permissions=custom_roles, default_role=None, use_email_roles=False
+            role_permissions=custom_roles, default_role=None, ldap_service=mock_ldap
         )
 
         assert auth_service.role_permissions == custom_roles
 
     def test_viewer_can_access_allowed_tools(self):
         """Test that mcp-viewer role can access read-only tools."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Viewer should be able to access these tools
         allowed_tools = [
@@ -75,14 +105,16 @@ class TestAuthorizationService:
 
     def test_viewer_cannot_access_execute_query(self):
         """Test that mcp-viewer role cannot access execute_query."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Viewer should NOT be able to execute raw queries
         assert auth_service.is_authorized(["mcp-viewer"], "execute_query") is False
 
     def test_admin_can_access_all_tools(self):
         """Test that mcp-admin role can access all tools including execute_query."""
-        auth_service = AuthorizationService(admin_usernames={"admin"})
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Admin should be able to access everything
         all_tools = [
@@ -93,20 +125,22 @@ class TestAuthorizationService:
         ]
 
         for tool in all_tools:
-            # Use email-based admin assignment
+            # Use LDAP-based admin assignment
             assert auth_service.is_authorized([], tool, user_email="admin@example.com") is True
 
     def test_user_with_no_groups_denied_strict(self):
         """Test that users without groups are denied access in strict mode."""
-        # Strict mode: no default role, no email-based roles
-        auth_service = AuthorizationService(default_role=None, use_email_roles=False)
+        mock_ldap = MockLDAPService(enabled=False)
+        # Strict mode: no default role
+        auth_service = AuthorizationService(default_role=None, ldap_service=mock_ldap)
 
         assert auth_service.is_authorized([], "list_databases") is False
 
     def test_user_with_no_groups_gets_default_role(self):
         """Test that users without groups get default viewer role."""
+        mock_ldap = MockLDAPService(enabled=False)
         # Default behavior: users get mcp-viewer role
-        auth_service = AuthorizationService()
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Should be able to access viewer tools
         assert auth_service.is_authorized([], "list_databases") is True
@@ -115,13 +149,15 @@ class TestAuthorizationService:
 
     def test_user_with_unknown_group_denied_strict(self):
         """Test that users with unknown groups are denied access in strict mode."""
-        auth_service = AuthorizationService(default_role=None, use_email_roles=False)
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(default_role=None, ldap_service=mock_ldap)
 
         assert auth_service.is_authorized(["unknown-group"], "list_databases") is False
 
     def test_user_with_unknown_group_gets_default_role(self):
         """Test that users with unknown groups get default viewer role."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Should be able to access viewer tools (default role applied)
         assert auth_service.is_authorized(["unknown-group"], "list_databases") is True
@@ -130,7 +166,8 @@ class TestAuthorizationService:
 
     def test_user_with_multiple_groups(self):
         """Test user with multiple groups gets combined permissions."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # User has both viewer and some unknown group
         groups = ["unknown-group", "mcp-viewer"]
@@ -140,22 +177,24 @@ class TestAuthorizationService:
         # But not admin access
         assert auth_service.is_authorized(groups, "execute_query") is False
 
-    def test_admin_email_grants_full_access(self):
-        """Test that admin email grants full access including execute_query."""
-        auth_service = AuthorizationService(admin_usernames={"admin"})
+    def test_ldap_admin_grants_full_access(self):
+        """Test that LDAP admin group grants full access including execute_query."""
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
-        # Admin email should grant full access
+        # Admin via LDAP should grant full access
         assert (
             auth_service.is_authorized([], "execute_query", user_email="admin@example.com") is True
         )
-        # Non-admin email should not have execute_query
+        # Non-admin via LDAP should not have execute_query
         assert (
             auth_service.is_authorized([], "execute_query", user_email="user@example.com") is False
         )
 
     def test_get_allowed_tools_for_viewer(self):
         """Test getting allowed tools for viewer role."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         allowed = auth_service.get_allowed_tools(["mcp-viewer"])
 
@@ -166,16 +205,18 @@ class TestAuthorizationService:
 
     def test_get_allowed_tools_for_admin(self):
         """Test getting allowed tools for admin role returns wildcard."""
-        auth_service = AuthorizationService(admin_usernames={"admin"})
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
-        # Use email-based admin assignment
+        # Use LDAP-based admin assignment
         allowed = auth_service.get_allowed_tools([], user_email="admin@example.com")
 
         assert allowed == {"*"}
 
     def test_get_denied_reason_no_groups_strict(self):
         """Test denied reason message for user with no groups in strict mode."""
-        auth_service = AuthorizationService(default_role=None, use_email_roles=False)
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(default_role=None, ldap_service=mock_ldap)
 
         reason = auth_service.get_denied_reason([], "execute_query")
 
@@ -184,7 +225,8 @@ class TestAuthorizationService:
 
     def test_get_denied_reason_no_groups_default(self):
         """Test denied reason when user gets default role but tool is admin-only."""
-        auth_service = AuthorizationService()  # Default: mcp-viewer role
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)  # Default: mcp-viewer role
 
         reason = auth_service.get_denied_reason([], "execute_query")
 
@@ -195,7 +237,8 @@ class TestAuthorizationService:
 
     def test_get_denied_reason_wrong_role(self):
         """Test denied reason message for user with insufficient role."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         reason = auth_service.get_denied_reason(["mcp-viewer"], "execute_query")
 
@@ -205,7 +248,8 @@ class TestAuthorizationService:
 
     def test_get_role_info(self):
         """Test getting role configuration info."""
-        auth_service = AuthorizationService()
+        mock_ldap = MockLDAPService(enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         info = auth_service.get_role_info()
 
@@ -214,25 +258,27 @@ class TestAuthorizationService:
         assert "mcp-admin" in info["roles"]
         assert info["roles"]["mcp-admin"]["access"] == "full"
         assert info["roles"]["mcp-viewer"]["access"] == "limited"
+        assert "ldap" in info
 
     def test_default_role_assignment(self):
         """Test default role for users without explicit assignment."""
-        auth_service = AuthorizationService(default_role="mcp-viewer", use_email_roles=False)
+        mock_ldap = MockLDAPService(enabled=False)
+        auth_service = AuthorizationService(default_role="mcp-viewer", ldap_service=mock_ldap)
 
         # User with no groups should get default role permissions
         assert auth_service.is_authorized([], "get_incidents") is True
         assert auth_service.is_authorized([], "execute_query") is False
 
 
-class TestUsernameBasedRoles:
-    """Tests for username-based role assignment."""
+class TestLDAPBasedRoles:
+    """Tests for LDAP-based role assignment."""
 
-    def test_admin_username_gets_admin_role(self):
-        """Test that admin username whitelist grants admin access."""
-        admin_usernames = {"admin", "team-lead"}
-        auth_service = AuthorizationService(admin_usernames=admin_usernames)
+    def test_ldap_admin_user_gets_admin_role(self):
+        """Test that LDAP admin user gets admin access."""
+        mock_ldap = MockLDAPService(admin_users={"admin", "team-lead"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
-        # Admin username should get full access
+        # Admin user should get full access
         assert (
             auth_service.is_authorized([], "execute_query", user_email="admin@redhat.com") is True
         )
@@ -240,12 +286,12 @@ class TestUsernameBasedRoles:
             auth_service.is_authorized([], "list_databases", user_email="admin@redhat.com") is True
         )
 
-    def test_non_admin_username_gets_viewer_role(self):
-        """Test that non-admin username gets viewer role."""
-        admin_usernames = {"admin"}
-        auth_service = AuthorizationService(admin_usernames=admin_usernames)
+    def test_non_ldap_admin_gets_viewer_role(self):
+        """Test that non-admin user gets viewer role."""
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
-        # Non-admin username should get viewer access only
+        # Non-admin user should get viewer access only
         assert (
             auth_service.is_authorized([], "list_databases", user_email="user@redhat.com") is True
         )
@@ -255,8 +301,8 @@ class TestUsernameBasedRoles:
 
     def test_username_matching_case_insensitive(self):
         """Test that username matching is case-insensitive."""
-        admin_usernames = {"admin"}
-        auth_service = AuthorizationService(admin_usernames=admin_usernames)
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Should match regardless of case
         assert (
@@ -268,8 +314,8 @@ class TestUsernameBasedRoles:
 
     def test_username_extracted_correctly(self):
         """Test that username is extracted from email correctly."""
-        admin_usernames = {"daturece"}
-        auth_service = AuthorizationService(admin_usernames=admin_usernames)
+        mock_ldap = MockLDAPService(admin_users={"daturece"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         # Username should be extracted from various email formats
         assert (
@@ -281,40 +327,32 @@ class TestUsernameBasedRoles:
             is True
         )
 
-    def test_resolve_user_roles_with_username(self):
-        """Test resolving roles when username matches admin list."""
-        admin_usernames = {"admin"}
-        auth_service = AuthorizationService(admin_usernames=admin_usernames)
+    def test_resolve_user_roles_with_ldap_admin(self):
+        """Test resolving roles when user is LDAP admin."""
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         roles = auth_service.resolve_user_roles([], "admin@redhat.com")
         assert "mcp-admin" in roles
 
-    def test_resolve_user_roles_without_match(self):
-        """Test resolving roles when username doesn't match admin list."""
-        admin_usernames = {"admin"}
-        auth_service = AuthorizationService(admin_usernames=admin_usernames)
+    def test_resolve_user_roles_without_ldap_match(self):
+        """Test resolving roles when user is not LDAP admin."""
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=True)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
         roles = auth_service.resolve_user_roles([], "user@redhat.com")
         assert "mcp-viewer" in roles
         assert "mcp-admin" not in roles
 
-    def test_get_admin_usernames_from_env(self):
-        """Test reading admin usernames from environment variable."""
-        with patch.dict(os.environ, {"RBAC_ADMIN_USERNAMES": "admin1, admin2, Admin3"}):
-            usernames = get_admin_usernames_from_env()
+    def test_ldap_disabled_falls_back_to_default(self):
+        """Test that LDAP disabled falls back to default role."""
+        mock_ldap = MockLDAPService(admin_users={"admin"}, enabled=False)
+        auth_service = AuthorizationService(ldap_service=mock_ldap)
 
-            assert "admin1" in usernames
-            assert "admin2" in usernames
-            assert "admin3" in usernames  # Should be lowercased
-
-    def test_get_admin_usernames_empty_env(self):
-        """Test reading admin usernames when env var is not set."""
-        with patch.dict(os.environ, {}, clear=True):
-            # Remove the env var if it exists
-            os.environ.pop("RBAC_ADMIN_USERNAMES", None)
-            usernames = get_admin_usernames_from_env()
-
-            assert usernames == set()
+        # Even admin users get default role when LDAP is disabled
+        roles = auth_service.resolve_user_roles([], "admin@redhat.com")
+        assert "mcp-viewer" in roles
+        assert "mcp-admin" not in roles
 
     def test_extract_username_from_email(self):
         """Test extracting username from email address."""
@@ -454,37 +492,6 @@ class TestToolHandlerRBAC:
         assert "Access denied" in response_text
         # Tool should not be called
         self.mock_tools_manager.call_tool.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_admin_can_call_any_tool(self):
-        """Test that admin (via username whitelist) can call any tool."""
-        # Create handler with admin usernames configured
-        with patch.dict(os.environ, {"RBAC_ADMIN_USERNAMES": "admin"}):
-            handler = ToolHandler(
-                self.mock_tools_manager,
-                self.mock_security_manager,
-                rbac_enabled=True,
-            )
-
-        # Set user context with admin email
-        set_user_context(
-            {
-                "id": "admin-123",
-                "username": "admin-user",
-                "email": "admin@example.com",
-                "groups": [],
-            }
-        )
-
-        # Mock tool execution
-        self.mock_tools_manager.call_tool.return_value = '{"success": true}'
-        self.mock_security_manager.validate_sql_query.return_value = (True, "OK")
-
-        # Call execute_query (admin only)
-        await handler.handle_tool_call("execute_query", {"query": "SELECT 1"})
-
-        # Should succeed - tool was called
-        self.mock_tools_manager.call_tool.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_no_user_context_denied(self):

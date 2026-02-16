@@ -146,16 +146,18 @@ class ToolHandler:
 
         # Extract user info from context
         user_groups = user_context.get("groups", [])
-        user_email = user_context.get("email")  # For email-based role assignment
+        user_email = user_context.get("email")
         username = user_context.get("username", "unknown")
 
-        # Check authorization (passing email for email-based role resolution)
-        if self.authorization_service.is_authorized(user_groups, tool_name, user_email):
+        # Check authorization (using username for LDAP lookup, email as fallback)
+        if self.authorization_service.is_authorized(user_groups, tool_name, user_email, username):
             self.logger.debug(f"User '{username}' ({user_email}) authorized for tool '{tool_name}'")
             return {"authorized": True}
 
         # Get detailed denial reason
-        reason = self.authorization_service.get_denied_reason(user_groups, tool_name, user_email)
+        reason = self.authorization_service.get_denied_reason(
+            user_groups, tool_name, user_email, username
+        )
         return {"authorized": False, "reason": reason}
 
     async def _validate_tool_request(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
